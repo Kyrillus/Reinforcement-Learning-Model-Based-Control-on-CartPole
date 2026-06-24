@@ -1,5 +1,5 @@
 """Temporary stand-in dynamics model used to develop and test the MPC planner
-before Person A's learned neural dynamics model is ready.
+before learned neural dynamics model is ready.
 
 This wraps the *true* CartPole physics (via a throwaway Gymnasium
 environment) behind the same `DynamicsModel` interface, so the planner

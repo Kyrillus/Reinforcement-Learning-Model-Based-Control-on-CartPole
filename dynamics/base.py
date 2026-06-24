@@ -1,8 +1,6 @@
 """Interface that any dynamics model must implement to be used by the MPC planner.
 
-Person A is responsible for the actual learned neural dynamics model
-(data collection + training, see Project 23 task b). This file only
-defines the contract the planner (Person B) relies on, plus the
+This file only defines the contract the planner relies on, plus the
 CartPole-specific reward/termination logic needed for planning, so the
 two halves of the project can be developed independently.
 """
