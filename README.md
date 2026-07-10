@@ -1,24 +1,7 @@
-# Project 23: Model-Based Control on CartPole
+# Model-Based Control on CartPole
 
-192.151 Introduction to Deep Learning — Person B's part: MPC Planner + Evaluation.
-
-## Scope of this part (Person B)
-
-- `mpc/random_shooting.py` — random shooting baseline planner.
-- `mpc/cem.py` — Cross-Entropy Method (CEM) planner over discrete action sequences.
-- `mpc/controller.py` — receding-horizon control loop (plan, execute first action, replan).
-- `evaluation/evaluate.py` — evaluation harness: episode return vs. environment steps, learning-curve plot.
-- `ablation/ablation.py` — ablations over horizon `H` and number of sampled sequences.
-- `dynamics/base.py` — the `DynamicsModel` interface the planner expects, plus CartPole-v1's reward/termination
-  logic (needed to score imagined rollouts).
-- `dynamics/stub_model.py` — a temporary true-physics stand-in implementing `DynamicsModel`, used to develop and
-  test the planner before the real learned model exists.
-
-## Not in this part (Person A)
-
-The actual learned neural dynamics model (data collection from the real environment + MLP training with a
-train/val split) is Person A's deliverable. Once that model implements the `DynamicsModel` interface in
-`dynamics/base.py`, swap it in for `StubDynamicsModel` in `evaluation/evaluate.py` and `ablation/ablation.py`.
+Model-based RL on CartPole-v1: a learned MLP dynamics model with MPC planning
+(random shooting and CEM), following Nagabandi et al. (arXiv:1708.02596).
 
 ## Setup
 
@@ -26,15 +9,29 @@ train/val split) is Person A's deliverable. Once that model implements the `Dyna
 pip install -r requirements.txt
 ```
 
-## Running
+## Run
 
 ```bash
-python -m evaluation.evaluate   # produces evaluation/learning_curve.png
-python -m ablation.ablation     # produces ablation/ablation_heatmap.png
-python -m pytest tests/         # sanity tests (planner runs end-to-end)
+python main.py            # full experiments: learning curves + all ablations
+python main.py --quick    # fast smoke test of the whole pipeline (~30s)
 ```
 
-## Reference
+Figures are written to `figures/`, numerical results to `results/results.json`.
+The ablations cover planning horizon, number of sampled action sequences,
+random shooting vs. CEM, delta vs. absolute state prediction, and
+dynamics-model size / training data amount.
 
-Nagabandi et al., "Neural Network Dynamics for Model-Based Deep Reinforcement Learning with Model Predictive
-Control" (2018). https://arxiv.org/pdf/1708.02596
+## Tests
+
+```bash
+python -m pytest tests/
+```
+
+## Report
+
+The project report is in `report/` (`report.pdf`, built from `report.tex`
+with the NeurIPS 2024 style). To rebuild it after rerunning the experiments:
+
+```bash
+cp figures/*.png report/figures/ && cd report && tectonic report.tex
+```

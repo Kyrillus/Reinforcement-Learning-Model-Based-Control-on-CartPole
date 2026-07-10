@@ -1,0 +1,285 @@
+\documentclass{article}
+
+\usepackage[final]{neurips_2024}
+
+% remove the conference notice from the first-page footer
+\makeatletter
+\renewcommand{\@noticestring}{}
+\makeatother
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\DeclareMathOperator*{\argmax}{arg\,max}
+\graphicspath{{figures/}}
+
+\title{Model-Based Control on CartPole with Learned Neural Network Dynamics and Model Predictive Control}
+
+\author{
+  Kyrillus Mehanni \\
+  Technical University of Vienna \\
+  \texttt{e12028191@student.tuwien.ac.at} \\
+  \And
+  Feodor Razumovich \\
+  Technical University of Vienna \\
+  \texttt{e12327933@student.tuwien.ac.at} \\
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We study model-based reinforcement learning on the CartPole-v1 balancing task, following the approach of Nagabandi et al.: a small neural network is trained to predict the change in the environment state given the current state and action, and actions are selected with model predictive control (MPC) by sampling action sequences, rolling them out through the learned model, and executing the first action of the best sequence. The main question we wanted to answer is whether learning a dynamics model actually makes training more sample efficient than model-free RL. On this task it clearly does: after training on only 1000 random-policy transitions the controller already reaches a mean return of about 300 out of 500, more than ten times the random-policy return, and performance plateaus within about 5000 environment steps in total, while model-free methods such as DQN typically need on the order of $10^5$ steps to solve CartPole. We ablate the planning horizon, the number of sampled action sequences, the sequence optimizer (random shooting vs.\ the cross-entropy method), the model output parameterization (state delta vs.\ absolute next state), and the model capacity and training data amount. Two findings stand out. First, predicting state deltas reduces the open-loop prediction error by a factor of 2 to 3 compared to predicting absolute states, even though the absolute variant has a lower normalized validation loss. Second, replacing the learned model with the true simulator dynamics does not improve control performance. The remaining gap to the maximum return is therefore not caused by model error, but by the planner itself: it only looks a short time ahead, and the survival reward gives it no reason to keep the cart near the center of the track.
+\end{abstract}
+
+\begin{center}
+  \footnotesize \url{https://github.com/Kyrillus/Reinforcement-Learning-Model-Based-Control-on-CartPole}
+\end{center}
+
+\section{Introduction}
+
+Model-free reinforcement learning methods such as deep Q-learning \citep{mnih2015} learn control policies directly from reward signals and can reach strong final performance, but they need a lot of data: even on small control problems, often tens or hundreds of thousands of environment interactions. In many settings, for example robotics, interactions with the real system are the dominant cost, which makes sample efficiency the central concern. Model-based reinforcement learning addresses this differently: instead of learning a policy, the agent learns a model of the environment dynamics from observed transitions and then uses that model for planning. Because the learned model can be queried arbitrarily often at no interaction cost, even a modest amount of real data can support a large amount of planning computation \citep{sutton2018, deisenroth2011}.
+
+In this project we follow the approach of \citet{nagabandi2018} and apply it to the CartPole-v1 balancing task. A small multilayer perceptron (MLP) is trained with a supervised loss to predict the change in the environment state given the current state and action. Control is done with model predictive control (MPC): at every time step the agent searches for an action sequence of fixed horizon $H$ that maximizes the cumulative reward predicted by the model, executes only the first action of the best sequence, observes the true next state, and replans. As sequence optimizers we implement random shooting, which scores $N$ uniformly sampled action sequences, and the cross-entropy method (CEM) \citep{rubinstein1999}, which iteratively refits a sampling distribution to the best sequences it has seen. Following \citet{nagabandi2018} and \citet{ross2011} we alternate model training with on-policy data collection, so that the training distribution covers the states the MPC controller actually visits.
+
+The goal of the project is not to push state-of-the-art numbers on CartPole, which is a solved problem, but to understand the behavior of the method through careful evaluation. Our contributions are:
+\begin{itemize}
+  \item a compact, self-contained implementation of the full pipeline (data collection, dynamics model training, MPC planning, evaluation) in about 1300 lines of Python;
+  \item a sample-efficiency evaluation showing that the method reaches strong performance within a few thousand environment steps;
+  \item ablations over the planning horizon $H$, the number of sampled action sequences $N$, the sequence optimizer (random shooting vs.\ CEM), the model output parameterization (state delta vs.\ absolute next state), and the model capacity and training data amount;
+  \item an oracle comparison in which the learned model is replaced by the true simulator dynamics, which lets us attribute the remaining performance gap to the planner rather than to model error.
+\end{itemize}
+
+\section{Background}
+
+\subsection{Problem setting}
+
+We consider a Markov decision process with states $s \in \mathcal{S}$, actions $a \in \mathcal{A}$, transition function $s_{t+1} = f(s_t, a_t)$, and reward function $r(s, a)$. The agent seeks to maximize the expected sum of rewards over an episode. In model-based RL the agent learns an approximation $\hat{f}_\theta$ of $f$ from a dataset of observed transitions $\mathcal{D} = \{(s_t, a_t, s_{t+1})\}$ and uses it to select actions. We assume the reward function is known, which is reasonable here because the CartPole reward is a fixed and simple function of the state.
+
+\subsection{CartPole-v1}
+\label{sec:cartpole}
+
+CartPole \citep{barto1983} is a classic control task in which a pole is attached by an unactuated joint to a cart that moves along a track. The state is four-dimensional: cart position $x$, cart velocity $\dot{x}$, pole angle $\theta$, and pole angular velocity $\dot{\theta}$. The two discrete actions push the cart left or right with a fixed force. The reward is $+1$ for every step, and an episode terminates when the pole angle leaves $\pm 12^\circ$, the cart position leaves $\pm 2.4$, or after 500 steps, so the return equals the episode length and the maximum return is 500. We use the Gymnasium implementation \citep{brockman2016, towers2024}, which integrates the dynamics with explicit Euler steps of $\Delta t = 0.02$ s. Episodes start from a state where all four components are drawn uniformly from $[-0.05, 0.05]$. A uniformly random policy survives for roughly 20 steps, which gives a lower reference point for all results.
+
+\subsection{Model predictive control}
+
+MPC turns a dynamics model into a controller without ever representing an explicit policy. At state $s_t$ the planner searches for the action sequence that looks best under the model over a fixed horizon $H$,
+\begin{equation}
+  (a_t^*, \dots, a_{t+H-1}^*) = \argmax_{a_t, \dots, a_{t+H-1}} \; \sum_{k=0}^{H-1} r(\hat{s}_{t+k}, a_{t+k}),
+  \qquad \hat{s}_{t+k+1} = \hat{f}_\theta(\hat{s}_{t+k}, a_{t+k}),
+  \label{eq:mpc}
+\end{equation}
+with $\hat{s}_t = s_t$. Only the first action $a_t^*$ is executed in the real environment; the resulting state is observed and the optimization is repeated. This receding-horizon scheme makes the controller robust to model error, since the plan is corrected against reality at every step, but it also means the controller cannot see further than $H$ steps ahead.
+
+Solving Equation~\ref{eq:mpc} exactly is infeasible ($2^H$ sequences for binary actions), so we use sampling-based optimizers. \emph{Random shooting} \citep{richards2005, nagabandi2018} draws $N$ action sequences uniformly at random, evaluates each by rolling it out through the model, and picks the best. The \emph{cross-entropy method} \citep{rubinstein1999} maintains a sampling distribution over sequences, here an independent categorical distribution over the two actions per time step. In each of a few iterations it samples $N$ sequences, selects the top fraction as elites, and refits the per-step distributions to the elite actions. This concentrates the search around promising sequences instead of spreading it uniformly, and it is also the optimizer used in later model-based RL work such as PETS \citep{chua2018}.
+
+\section{Method}
+
+Our implementation follows \citet{nagabandi2018}, reduced to the parts needed for a discrete-action task.
+
+\subsection{Dynamics model}
+
+The dynamics model is an MLP $\hat{f}_\theta$ that takes the current state $s_t \in \mathbb{R}^4$ concatenated with a one-hot encoding of the action $a_t \in \{0, 1\}$ and outputs the predicted state \emph{change},
+\begin{equation}
+  \hat{s}_{t+1} = s_t + \hat{\Delta}_\theta(s_t, a_t).
+\end{equation}
+Predicting the delta rather than the absolute next state is the parameterization recommended by \citet{nagabandi2018}: since consecutive states are similar, an absolute-state network must spend most of its capacity reproducing its input, and small relative errors in the output are large relative to the actual state change. We evaluate both parameterizations in Section~\ref{sec:delta}.
+
+The default network has two hidden layers of 64 units with ReLU activations, about 4900 parameters. Inputs and regression targets are standardized componentwise using the mean and standard deviation of the training set, which is important because the four state dimensions have quite different scales.
+
+The model is trained with the mean squared error on the normalized targets using Adam \citep{kingma2015} with learning rate $10^{-3}$ and batch size 256. We hold out 10\% of the transitions as a validation set, train for at most 200 epochs, stop early when the validation loss has not improved for 10 epochs, and keep the parameters of the best validation epoch.
+
+\subsection{Data collection and aggregation}
+
+Purely random exploration data is cheap but covers only the states a random policy reaches, which on CartPole means short trajectories that quickly tip over. A model trained only on such data is queried far outside its training distribution once the controller starts balancing successfully. Following \citet{nagabandi2018}, and in the spirit of DAgger \citep{ross2011}, we therefore alternate between model training and on-policy data collection: the transitions visited by the MPC controller are added to the dataset and the model is retrained from scratch on the union. Algorithm~\ref{alg:loop} summarizes the loop; the episodes collected in each iteration double as the evaluation of the model trained in that iteration, which is what our learning curves report.
+
+\begin{algorithm}[t]
+\caption{Model-based training loop with on-policy aggregation}
+\label{alg:loop}
+\begin{algorithmic}[1]
+\State $\mathcal{D} \gets$ transitions from random-policy interaction
+\For{iteration $= 1, 2, \dots$}
+  \State train $\hat{f}_\theta$ on $\mathcal{D}$ with a train/validation split and early stopping
+  \For{a fixed number of episodes}
+    \State run one episode with MPC (Equation~\ref{eq:mpc}) using $\hat{f}_\theta$; record its return
+    \State add the visited transitions to $\mathcal{D}$
+  \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Planning}
+
+Both planners score a candidate action sequence by rolling it out through the model as a batch and summing the predicted rewards. Since the CartPole reward is simply $+1$ per surviving step, scoring reduces to counting how many steps of the imagined rollout stay within the termination thresholds; once an imagined rollout violates a threshold it stops accumulating reward. All $N$ rollouts are propagated in parallel as a single batched forward pass per time step, so planning cost is $H$ (times the number of CEM iterations) forward passes per environment step.
+
+Random shooting uses the current state, samples $N$ sequences uniformly, and returns the first action of the best one. CEM runs 5 iterations with $N$ samples each and an elite fraction of 0.1, refitting an independent categorical distribution per planning time step to the elites, and returns the first action of the best elite of the final iteration. Unless stated otherwise both planners use horizon $H = 20$ and $N = 200$ sampled sequences per iteration.
+
+\section{Experiments}
+
+\subsection{Setup}
+\label{sec:setup}
+
+\paragraph{Implementation.} The pipeline is implemented in Python with PyTorch \citep{paszke2019} for the dynamics model and Gymnasium \citep{towers2024} for the environment. All experiments run on a laptop CPU; the complete suite reported here (learning curves over three seeds plus all ablations) takes about 7 minutes. Table~\ref{tab:hyper} lists the default hyperparameters, which are used everywhere unless a specific ablation varies them.
+
+\begin{table}[t]
+  \caption{Default hyperparameters.}
+  \label{tab:hyper}
+  \centering
+  \begin{tabular}{ll}
+    \toprule
+    Dynamics model & MLP, 2 hidden layers $\times$ 64 units, ReLU, 4868 parameters \\
+    Model output & state delta $\Delta s_t$ (one-hot action input) \\
+    Optimizer & Adam, learning rate $10^{-3}$, batch size 256 \\
+    Training & max.\ 200 epochs, 10\% validation split, early stopping (patience 10) \\
+    Planning horizon & $H = 20$ \\
+    Sampled sequences & $N = 200$ per iteration \\
+    CEM & 5 iterations, elite fraction 0.1 \\
+    Evaluation & 15 episodes per configuration, fixed seeds, mean $\pm$ std \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Datasets.} All training data comes from the environment itself, so the dataset description is the collection procedure. For the learning-curve experiment (Section~\ref{sec:lc}) each run starts from 1000 transitions collected by a uniformly random policy and then grows by three on-policy MPC episodes per iteration, following Algorithm~\ref{alg:loop}. For the ablations we fix a single dataset so that all configurations see identical data: 2000 random-policy transitions plus on-policy MPC episodes, collected in rounds with the model retrained between rounds, until at least 8000 transitions are available, then subsampled uniformly to exactly 8000. Roughly three quarters of this dataset is on-policy data. Each transition is a tuple $(s_t, a_t, s_{t+1})$ with the four-dimensional state described in Section~\ref{sec:cartpole}. Random-policy episodes are short (about 20 steps) and stay close to the initial state region, while the on-policy episodes cover the states a balancing controller visits, including slow drifts of the cart along the track.
+
+\paragraph{Model training.} Figure~\ref{fig:training} shows the training and validation loss of the default model on the ablation dataset. The model reaches a validation MSE of about $5 \cdot 10^{-5}$ in normalized target space. Train and validation loss stay close throughout, so overfitting is not a concern at this data size; early stopping typically triggers after roughly 150 epochs.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.48\linewidth]{training_curve.png}
+  \caption{Training and validation loss (MSE on normalized targets) of the default dynamics model on the 8000-transition ablation dataset.}
+  \label{fig:training}
+\end{figure}
+
+\paragraph{Evaluation protocol.} Every reported configuration is evaluated for 15 episodes with fixed, distinct environment seeds and planner seeds, and we report the mean and standard deviation of the episode returns. The standard deviations are large throughout (often 100 or more). This is a property of the task and controller rather than of the measurement: depending on the initial state, the cart sometimes drifts slowly toward the track boundary and the episode ends early. We therefore base conclusions only on differences that are large relative to this spread and point out explicitly where observed differences are within the noise.
+
+\subsection{Overall performance and sample efficiency}
+\label{sec:lc}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.48\linewidth]{learning_curve.png}
+  \hfill
+  \includegraphics[width=0.48\linewidth]{baselines.png}
+  \caption{Left: mean episode return vs.\ real environment steps in the training data, for three seeds per planner (shaded: $\pm$ 1 std across seeds). Each point evaluates the model trained on the data collected up to that point. Right: baseline comparison at the default settings ($H = 20$, $N = 200$); ``true dyn.''\ replaces the learned model with the exact simulator dynamics.}
+  \label{fig:main}
+\end{figure}
+
+\begin{table}[t]
+  \caption{Baseline comparison at the default settings, 15 episodes per entry.}
+  \label{tab:baselines}
+  \centering
+  \begin{tabular}{lcc}
+    \toprule
+    & Learned model & True dynamics \\
+    \midrule
+    Random policy & \multicolumn{2}{c}{$23.3 \pm 9.5$} \\
+    MPC, random shooting & $257.7 \pm 111.1$ & $228.4 \pm 94.9$ \\
+    MPC, CEM & $300.3 \pm 131.7$ & $304.1 \pm 109.0$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Figure~\ref{fig:main} (left) shows the primary metric, episode return as a function of real environment steps consumed for training data. The method needs very little data. The first model, trained only on 1000 random transitions, already yields a controller with a mean return around 170 (random shooting) to 300 (CEM), an order of magnitude above the random policy at 23. Performance improves modestly over the next iterations and plateaus around 250 for random shooting and 300 to 400 for CEM after roughly 5000 total environment steps, with substantial spread across seeds. For comparison, model-free methods such as DQN typically need on the order of $10^5$ environment steps to solve CartPole \citep{mnih2015}, two orders of magnitude more.
+
+The plateau below the maximum return of 500 is the more interesting observation, and Table~\ref{tab:baselines} explains it. Replacing the learned model with the exact simulator dynamics changes performance by less than the evaluation noise in both directions (random shooting even drops slightly). In other words, at the default settings the learned model is already good enough that the controller would not benefit from a perfect one; the bottleneck is the planner itself. We return to this in Section~\ref{sec:discussion}.
+
+\subsection{Planner ablations}
+\label{sec:planner-abl}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.48\linewidth]{ablation_horizon.png}
+  \hfill
+  \includegraphics[width=0.48\linewidth]{ablation_sequences.png}
+  \caption{Planner ablations with the default learned model (error bars: $\pm$ 1 std over 15 episodes). Left: planning horizon $H$ at $N = 200$. Right: number of sampled sequences $N$ at $H = 20$ (log scale).}
+  \label{fig:planner}
+\end{figure}
+
+\paragraph{Random shooting vs.\ CEM.} Across every configuration in Figure~\ref{fig:planner}, CEM matches or beats random shooting, by roughly 40 to 180 return depending on the setting. Both planners evaluate the same number of model rollouts per iteration; CEM just uses them better, because later samples concentrate on action patterns that already worked in earlier iterations. This matters because a uniformly random action sequence of length 20 or 30 usually topples the pole in the model rollout, so the best of $N$ uniform samples is a noisy choice, whereas CEM's refitted per-step distributions keep whole surviving sequences in the pool.
+
+\paragraph{Planning horizon.} Random shooting is flat in $H$ within noise ($226.6 \pm 113.3$, $257.7 \pm 111.1$, $227.3 \pm 82.9$ for $H = 10, 20, 30$). The CEM sweep in Figure~\ref{fig:planner} suggests a dip at $H = 20$ ($403.3$, $300.3$, $424.0$), but this does not survive a closer look: repeating the CEM sweep with a different set of evaluation seeds gives $375.9 \pm 118.2$, $344.5 \pm 115.2$, and $348.5 \pm 126.5$, so both the dip at $H = 20$ and the peak at $H = 30$ are within the evaluation noise. Our conclusion is that over the tested range performance is largely insensitive to the horizon for both planners; the reliable effect in this figure is the planner gap, not the horizon. A likely reason for this insensitivity is discussed in Section~\ref{sec:discussion}.
+
+\paragraph{Number of sequences.} Increasing $N$ from 50 to 500 changes both planners by less than one standard deviation (random shooting $238.9 \to 243.4$, CEM $291.9 \to 310.3$). With only two actions, 50 samples per iteration already seem to cover the sequences that matter; compute is better spent on CEM iterations or the horizon than on more samples.
+
+\subsection{Model ablations}
+\label{sec:delta}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.35\linewidth]{delta_vs_absolute.png}
+  \hfill
+  \includegraphics[width=0.44\linewidth]{multistep_error.png}
+  \caption{Output parameterization ablation, both models trained on the same 8000 transitions. Left: episode return with random shooting at default settings. Right: open-loop prediction error, i.e.\ mean $L_2$ distance between the predicted and true state after $k$ steps when unrolling the model on recorded action sequences from held-out trajectories (log scale).}
+  \label{fig:delta}
+\end{figure}
+
+\paragraph{Delta vs.\ absolute next state.} Figure~\ref{fig:delta} compares predicting the state change $\Delta s_t$ against predicting $s_{t+1}$ directly, with both networks trained identically on the same data. In episode return the difference is visible but within the noise ($257.7 \pm 111.1$ vs.\ $235.3 \pm 94.5$). The open-loop rollouts show the real difference: the delta model's prediction error is a factor 2 to 3 lower at every unroll depth, e.g.\ $0.060$ vs.\ $0.161$ after 30 steps. Interestingly, the absolute model has the \emph{lower} validation loss ($8 \cdot 10^{-6}$ vs.\ $4.9 \cdot 10^{-5}$), but this comes from the normalization: its targets $s_{t+1}$ vary over the whole state range, so a small normalized error still corresponds to a large error relative to the actual per-step state change. This is exactly why \citet{nagabandi2018} recommend predicting deltas, and it also shows that validation losses cannot be compared between the two output types. That the return gap stays small despite the accuracy gap is consistent with the oracle result: at $H = 20$ the planner does not need a highly accurate model.
+
+\paragraph{Model capacity and data amount.} Figure~\ref{fig:capacity} and Table~\ref{tab:model} vary the hidden layer width (16, 64, 256 units) at the full 8000 transitions, and the number of training transitions (500, 2000, 8000) at the default width. Neither axis produces differences beyond the noise. A network with 16 hidden units and only 452 parameters, trained on 500 transitions, is essentially as good for control as the largest configuration, even though the validation MSE improves by a factor of about 75 between 500 and 8000 transitions. CartPole dynamics are smooth and low-dimensional, so very little capacity and data suffice to reach the model quality the planner can exploit; past that point, better models stop paying off. We expect this to look different on higher-dimensional tasks, where \citet{nagabandi2018} report clear gains from more data.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\linewidth]{capacity_and_data.png}
+  \caption{Model capacity and data ablations, random shooting at default settings (error bars: $\pm$ 1 std over 15 episodes). Left: hidden layer width, trained on 8000 transitions. Right: number of training transitions, width 64.}
+  \label{fig:capacity}
+\end{figure}
+
+\begin{table}[t]
+  \caption{Model ablations: episode return and validation MSE (normalized targets).}
+  \label{tab:model}
+  \centering
+  \begin{tabular}{lccc}
+    \toprule
+    Configuration & Parameters & Return & Val.\ MSE \\
+    \midrule
+    Hidden width 16 & 452 & $216.2 \pm 89.8$ & $2.7 \cdot 10^{-5}$ \\
+    Hidden width 64 (default) & 4868 & $257.7 \pm 111.1$ & $4.9 \cdot 10^{-5}$ \\
+    Hidden width 256 & 68\,612 & $248.1 \pm 103.4$ & $6.2 \cdot 10^{-5}$ \\
+    \midrule
+    500 transitions & 4868 & $284.5 \pm 100.6$ & $1.1 \cdot 10^{-3}$ \\
+    2000 transitions & 4868 & $222.4 \pm 90.1$ & $4.4 \cdot 10^{-4}$ \\
+    8000 transitions (default) & 4868 & $258.4 \pm 121.1$ & $1.5 \cdot 10^{-5}$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Discussion}
+\label{sec:discussion}
+
+\paragraph{What works.} The overall recipe works well for how simple it is: a 5000-parameter MLP, a few thousand transitions, and a sampling-based planner solve the task to a large extent within minutes of CPU time and with two orders of magnitude fewer environment steps than typical model-free baselines. The delta parameterization and input/target normalization matter for model quality and cost nothing. CEM is a clear improvement over random shooting at equal sample budget, and it is the only knob among those we ablated whose effect is clearly outside the evaluation noise.
+
+\paragraph{Where it struggles.} No configuration reliably reaches the 500-step cap, and the evaluation variance is high everywhere. The oracle experiment shows where the problem is: it is not model error but the combination of a short planning horizon with a reward that says nothing about \emph{how well} the system is doing. Every action sequence that keeps the pole up for all of the horizon gets the same maximal score, so among such sequences the planner picks arbitrarily, and nothing penalizes a slow drift of the cart toward the edge of the track that only becomes fatal 50 steps later. The failure statistics match this: over 30 evaluation episodes at the default settings, 13 ended with the cart reaching the track boundary, 13 with the pole falling, and only 4 reached the 500-step cap, so half of the failures are the slow kind that a 20-step lookahead only notices when it is too late. Extending the horizon within the tested range does not fix this (Section~\ref{sec:planner-abl}): even $H = 30$ is only 0.6 s of lookahead, and as long as many sequences survive the whole horizon the objective still cannot distinguish a centered cart from one drifting outward. A perfect model does not help either, which rules out the model as the cause.
+
+\paragraph{Limitations of the evaluation.} With 15 episodes per configuration and per-episode standard deviations above 100, only the large effects (vs.\ the random policy, CEM vs.\ random shooting, the open-loop error gap) are clearly outside the noise; the smaller ordering effects between adjacent configurations should not be over-interpreted. The standard errors of the reported means are roughly 25 to 35 return.
+
+\section{Conclusion}
+
+We implemented and evaluated the model-based RL approach of \citet{nagabandi2018} on CartPole-v1: an MLP dynamics model trained on observed transitions, combined with sampling-based MPC and on-policy data aggregation. The method reaches roughly ten times the random-policy return after a single model fit on 1000 random transitions and plateaus at a mean return of roughly 250 (random shooting) to 350 (CEM) within about 5000 environment steps, far more sample efficient than typical model-free learners on this task. The ablations give a consistent overall picture. On the model side the problem is easy: a few hundred parameters and a few hundred transitions produce a model whose remaining error no longer limits control, and predicting state deltas rather than absolute states improves open-loop accuracy by a factor of 2 to 3 at no extra cost. On the planner side the problem is harder than it looks: with a pure survival reward and a short horizon, the controller does not react to problems that build up slowly, and this, not model quality, is what keeps every configuration below the maximum return. For tasks of this scale, the practical lesson is to spend effort on the sequence optimizer and the planning objective rather than on model capacity or extra data. A second lesson is to validate dynamics models with open-loop rollouts; the one-step validation loss can be misleading, as the delta vs.\ absolute comparison showed.
+
+\section{Future work}
+
+The clearest next step follows directly from the failure analysis in Section~\ref{sec:discussion}: give the planner a reason to keep the cart centered. The simplest version is to add a small penalty on $|x|$ and $|\theta|$ to the planning objective, which would break the ties between sequences that all survive the horizon. Since the drift toward the track boundary is responsible for about half of the failures, we would expect this change alone to push many more episodes to the 500-step cap, and it is the first thing we would try with more time. A more general version of the same idea is to learn a value function for the state at the end of the horizon, so that the planner gets an estimate of what happens beyond the $H$ steps it can see. Finally, \citet{nagabandi2018} continue by distilling the MPC controller into an explicit policy that is then fine-tuned with model-free RL; this would remove the planning cost at execution time and is the natural continuation of the approach we followed.
+
+\section*{Division of work}
+
+The work was split roughly along the module boundaries of the code base. Feodor Razumovich implemented the core pipeline: the dynamics model and its training setup (\texttt{dynamics/}), the data collection and aggregation (\texttt{data/}), and the MPC planners (\texttt{mpc/}). Kyrillus Mehanni implemented the evaluation harness, the ablation suite, and the figure generation (\texttt{evaluation/}, \texttt{ablation/}, \texttt{main.py}) and ran the experiments. The split was not strict; both of us worked on and debugged both parts, and the analysis and the report were written together.
+
+\section*{Use of AI assistance}
+
+Fable 5 (Anthropic) was used during the project to help with understanding the reference papers, refactoring code, and debugging.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

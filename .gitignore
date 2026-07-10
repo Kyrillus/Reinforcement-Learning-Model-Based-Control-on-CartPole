@@ -3,4 +3,5 @@ __pycache__/
 .idea/
 .vscode/
 *.png
+!figures/*.png
 .pytest_cache/
