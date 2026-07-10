@@ -13,7 +13,6 @@ pip install -r requirements.txt
 
 ```bash
 python main.py            # full experiments: learning curves + all ablations
-python main.py --quick    # fast smoke test of the whole pipeline (~30s)
 ```
 
 Figures are written to `figures/`, numerical results to `results/results.json`.
