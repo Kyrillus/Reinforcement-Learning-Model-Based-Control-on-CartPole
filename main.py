@@ -1,10 +1,14 @@
-"""Run the full pipeline: learning curves, all ablations, and figures.
+"""Run the full pipeline: learning curves (training), all ablations, and figures.
 
 Usage:
-    python main.py            # full experiments (takes a while on CPU)
-    python main.py --quick    # small smoke-test run of the whole pipeline
+    python main.py                    # everything: training/learning curves + ablations
+    python main.py --learning-curve   # only the training experiment (learning curves)
+    python main.py --ablations        # only the ablations
+    python main.py --quick            # small smoke-test run (combinable with the above)
 
-Writes figures to figures/ and all numerical results to results/results.json.
+Writes figures to figures/ and numerical results to results/results.json.
+When a stage is run on its own, its results are merged into an existing
+results.json instead of replacing it.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from ablation.ablation import (
     build_ablation_dataset,
     collect_test_trajectories,
     multistep_prediction_error,
+    random_policy_returns,
     train_model,
 )
 from evaluation.evaluate import run_learning_curve
@@ -58,18 +63,9 @@ QUICK = {
 }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--quick", action="store_true", help="small smoke-test run")
-    parser.add_argument("--figdir", default="figures")
-    parser.add_argument("--outdir", default="results")
-    args = parser.parse_args()
-    cfg = QUICK if args.quick else FULL
-
-    start = time.time()
-    results: dict = {"config": cfg}
-
-    print("[1/4] Learning curves (train model, run MPC, aggregate data) ...")
+def run_learning_curves(cfg: dict, figdir: str) -> dict:
+    """The training experiment: train the model, run MPC, aggregate data."""
+    print("Learning curves (train model, run MPC, aggregate data) ...")
     curves: dict = {}
     for planner in ("random_shooting", "cem"):
         curves[planner] = []
@@ -82,15 +78,23 @@ def main() -> None:
             )
             curves[planner].append((env_steps, mean_returns))
             print(f"    {planner} seed {seed}: returns per iteration {mean_returns}")
-    results["learning_curves"] = curves
 
-    print("[2/4] Building the fixed ablation dataset and default model ...")
+    random_policy_mean = float(np.mean(random_policy_returns(cfg["eval_episodes"], seed=0)))
+    plots.plot_learning_curves(curves, random_policy_mean, figdir)
+    return {"learning_curves": curves}
+
+
+def run_ablations(cfg: dict, figdir: str) -> dict:
+    """All ablations and baselines on a fixed dataset."""
+    results: dict = {}
+
+    print("Building the fixed ablation dataset and default model ...")
     dataset = build_ablation_dataset(target_size=cfg["dataset_size"])
     model, history = train_model(dataset)
     results["default_model_val_mse"] = history["best_val_loss"]
-    plots.plot_training_curve(history, args.figdir)
+    plots.plot_training_curve(history, figdir)
 
-    print("[3/4] Baselines and planner ablations ...")
+    print("Baselines and planner ablations ...")
     results["baselines"] = baselines(model, cfg["eval_episodes"], seed=0)
     print(f"    baselines: " + ", ".join(
         f"{k}={v['mean']:.0f}" for k, v in results["baselines"].items()))
@@ -98,7 +102,7 @@ def main() -> None:
     results["num_sequences"] = ablation_num_sequences(
         model, cfg["sequence_counts"], cfg["eval_episodes"], seed=0)
 
-    print("[4/4] Model ablations (delta vs. absolute, size, data amount) ...")
+    print("Model ablations (delta vs. absolute, size, data amount) ...")
     results["delta_vs_absolute"], variant_models = ablation_delta_vs_absolute(
         dataset, cfg["eval_episodes"], seed=0)
     trajectories = collect_test_trajectories(model, num_mpc=3, num_random=10, seed=0)
@@ -108,22 +112,51 @@ def main() -> None:
     results["data_amount"] = ablation_data_amount(
         dataset, cfg["data_sizes"], cfg["eval_episodes"], seed=0)
 
-    random_policy_mean = results["baselines"]["random_policy"]["mean"]
-    plots.plot_learning_curves(curves, random_policy_mean, args.figdir)
-    plots.plot_baselines(results["baselines"], args.figdir)
-    plots.plot_horizon_ablation(results["horizon"], cfg["horizons"], args.figdir)
-    plots.plot_sequences_ablation(results["num_sequences"], cfg["sequence_counts"], args.figdir)
-    plots.plot_delta_vs_absolute(results["delta_vs_absolute"], args.figdir)
-    plots.plot_multistep_error(results["multistep_error"], args.figdir)
-    plots.plot_capacity_and_data(results["model_size"], results["data_amount"], args.figdir)
+    plots.plot_baselines(results["baselines"], figdir)
+    plots.plot_horizon_ablation(results["horizon"], cfg["horizons"], figdir)
+    plots.plot_sequences_ablation(results["num_sequences"], cfg["sequence_counts"], figdir)
+    plots.plot_delta_vs_absolute(results["delta_vs_absolute"], figdir)
+    plots.plot_multistep_error(results["multistep_error"], figdir)
+    plots.plot_capacity_and_data(results["model_size"], results["data_amount"], figdir)
+    return results
 
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--quick", action="store_true", help="small smoke-test run")
+    parser.add_argument("--learning-curve", action="store_true",
+                        help="run only the training experiment (learning curves)")
+    parser.add_argument("--ablations", action="store_true",
+                        help="run only the ablations")
+    parser.add_argument("--figdir", default="figures")
+    parser.add_argument("--outdir", default="results")
+    args = parser.parse_args()
+    cfg = QUICK if args.quick else FULL
+    run_all = not (args.learning_curve or args.ablations)
+
+    start = time.time()
+    results: dict = {"config": cfg}
+
+    if run_all or args.learning_curve:
+        results.update(run_learning_curves(cfg, args.figdir))
+    if run_all or args.ablations:
+        results.update(run_ablations(cfg, args.figdir))
+
+    # Merge into an existing results.json so single-stage runs keep the
+    # results of the other stage.
     os.makedirs(args.outdir, exist_ok=True)
-    results["runtime_seconds"] = round(time.time() - start, 1)
-    with open(os.path.join(args.outdir, "results.json"), "w") as f:
-        json.dump(results, f, indent=2)
+    results_path = os.path.join(args.outdir, "results.json")
+    merged: dict = {}
+    if not run_all and os.path.exists(results_path):
+        with open(results_path) as f:
+            merged = json.load(f)
+    merged.update(results)
+    merged["runtime_seconds"] = round(time.time() - start, 1)
+    with open(results_path, "w") as f:
+        json.dump(merged, f, indent=2)
 
-    print(f"Done in {results['runtime_seconds']:.0f}s. "
-          f"Figures in {args.figdir}/, results in {args.outdir}/results.json")
+    print(f"Done in {merged['runtime_seconds']:.0f}s. "
+          f"Figures in {args.figdir}/, results in {results_path}")
 
 
 if __name__ == "__main__":

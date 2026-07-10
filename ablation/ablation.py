@@ -115,12 +115,10 @@ def ablation_num_sequences(
     return results
 
 
-def baselines(model: DynamicsModel, num_episodes: int, seed: int) -> dict:
-    """Random policy, MPC with the learned model, and MPC with true dynamics."""
-    results: dict = {}
-
+def random_policy_returns(num_episodes: int, seed: int) -> list[float]:
+    """Episode returns of a uniformly random policy."""
     env = gym.make("CartPole-v1")
-    random_returns = []
+    returns = []
     for i in range(num_episodes):
         rng = np.random.default_rng(seed + i)
         _, _ = env.reset(seed=seed + i)
@@ -129,9 +127,15 @@ def baselines(model: DynamicsModel, num_episodes: int, seed: int) -> dict:
             _, reward, terminated, truncated, _ = env.step(int(rng.integers(2)))
             episode_return += reward
             done = terminated or truncated
-        random_returns.append(episode_return)
+        returns.append(episode_return)
     env.close()
-    results["random_policy"] = summarize(random_returns)
+    return returns
+
+
+def baselines(model: DynamicsModel, num_episodes: int, seed: int) -> dict:
+    """Random policy, MPC with the learned model, and MPC with true dynamics."""
+    results: dict = {}
+    results["random_policy"] = summarize(random_policy_returns(num_episodes, seed))
 
     oracle = TrueDynamicsModel()
     for planner in PLANNERS:

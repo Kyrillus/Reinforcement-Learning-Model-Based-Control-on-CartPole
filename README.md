@@ -12,10 +12,13 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python main.py            # full experiments: learning curves + all ablations
+python main.py                    # everything: training (learning curves) + all ablations
+python main.py --learning-curve   # only the training experiment (learning curves)
+python main.py --ablations        # only the ablations
 ```
 
-Figures are written to `figures/`, numerical results to `results/results.json`.
+Figures are written to `figures/`, numerical results to `results/results.json`
+(single-stage runs merge into an existing results.json instead of replacing it).
 The ablations cover planning horizon, number of sampled action sequences,
 random shooting vs. CEM, delta vs. absolute state prediction, and
 dynamics-model size / training data amount.
